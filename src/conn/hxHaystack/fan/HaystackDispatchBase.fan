@@ -18,7 +18,7 @@ using hxConn
 **
 ** Dispatch callbacks for the Haystack connector
 **
-class HaystackDispatch : ConnDispatch
+class HaystackDispatchBase : ConnDispatch
 {
   new make(Obj arg)  : super(arg) {}
 
@@ -29,7 +29,10 @@ class HaystackDispatch : ConnDispatch
   override Obj? onReceive(HxMsg msg)
   {
     msgId := msg.id
+    if (msgId === "ping")         return doPing
+    if (msgId === "learn")        return doLearn(msg.a)
     if (msgId === "call")         return onCall(msg.a, msg.b, msg.c)
+    if (msgId === "callRes")      return onCallRes(msg.a, msg.b)
     if (msgId === "readById")     return onReadById(msg.a, msg.b)
     if (msgId === "readByIds")    return onReadByIds(msg.a, msg.b)
     if (msgId === "read")         return onRead(msg.a, msg.b)
@@ -54,7 +57,10 @@ class HaystackDispatch : ConnDispatch
 
     // open client
     opts := ["log":trace.asLog, "timeout":conn.timeout]
-    client = Client.open(uri, user, pass, opts)
+    client = HaystackClient.open(uri, user, pass, opts, ActorPool {
+      it.name = "$conn.pool - Workers for $id.toProjRel"
+      it.maxThreads = 10
+    })
   }
 
   override Void onClose()
@@ -74,8 +80,51 @@ class HaystackDispatch : ConnDispatch
   override Dict onPing()
   {
     // call "about" operation
-    about := client.about
+    _doPing(client.doCallFn("about", HaystackClient.gridToStr(Etc.makeEmptyGrid), null) |resStr|
+    {
+      res := ZincReader(resStr.in).readGrid
+      if (res.isErr) throw CallErr(res)
+      return res.first
+    }.call)
+  }
 
+  Future? doPing()
+  {
+    try
+    {
+      this->openForPing = true
+      open
+    }
+    finally this->openForPing = false
+    return rec["connState"] ? callThen("about", Etc.makeEmptyGrid) |getGrid, me|
+    {
+      r := (Dict?) null
+      try r = _doPing(getGrid.get.first)
+      catch (Err e)
+      {
+        me->updateConnErr(e)
+        return null
+      }
+      me->lastPing = Duration.nowTicks
+      me->updateConnOk
+      changes := Str:Obj[:]
+      r.each |v, n|
+      {
+        if (v === Remove.val || v == null)
+        {
+          if (me.rec.has(n))
+            changes[n] = Remove.val
+        } else if (me.rec[n] != v)
+          changes[n] = v
+      }
+      if (!changes.isEmpty)
+        me.db.commit(Diff(me.rec, changes, Diff.force))
+      return null
+    } : null
+  }
+
+  static Dict _doPing(Dict about)
+  {
     // update tags
     tags := Str:Obj[:]
     if (about["productName"]    is Str) tags["productName"]    = about->productName
@@ -100,17 +149,38 @@ class HaystackDispatch : ConnDispatch
 // Call
 //////////////////////////////////////////////////////////////////////////
 
-  Grid onCall(Str op, Grid req, Bool checked)
-  {
-    call(op, req, checked)
-  }
-
-  Grid call(Str op, Grid req, Bool checked := true)
+  Future onCall(Str op, Grid req, Bool checked)
   {
     openClient.call(op, req, checked)
   }
 
-  Client openClient()
+  private Future callThen(Str op, Grid req, |GridOrErr, HaystackDispatchBase?->Obj?| thenFn)
+  {
+    inConn := AtomicBool(false)
+    actor := conn
+    callRes := HaystackCallRes(this, thenFn)
+    fn := |Obj res->Obj?|
+    {
+      if (res is Grid)
+        inConn.val = true
+      else if (inConn.val) throw res
+      getGrid := res is Grid ? GridOrErr.makeGrid(res) : GridOrErr.makeErr(res)
+      result := thenFn.params.size > 1
+        ? actor.send(HxMsg("callRes", callRes, getGrid)).get
+        : thenFn(getGrid, null)
+      if (result is Err) throw result
+      return result
+    }
+    return openClient.call(op, req, true, fn, fn)
+  }
+
+  private Obj? onCallRes(HaystackCallRes callRes, GridOrErr getGrid)
+  {
+    try return callRes.fn.call(getGrid, this).toImmutable
+    catch (Err e) return e
+  }
+
+  HaystackClient openClient()
   {
     open
     return client
@@ -143,13 +213,13 @@ class HaystackDispatch : ConnDispatch
   Obj? onEval(Str expr, Dict opts)
   {
     req := Etc.makeListGrid(opts, "expr", null, [expr])
-    return openClient.call("eval", req)
+    return callThen("eval", req) |getGrid| { getGrid.get }
   }
 
   Obj? onInvokeAction(Obj id, Str action, Dict args)
   {
     req := Etc.makeDictGrid(["id":id, "action":action], args)
-    return openClient.call("invokeAction", req)
+    return callThen("invokeAction", req) |getGrid| { getGrid.get }
   }
 
 //////////////////////////////////////////////////////////////////////////
@@ -157,6 +227,11 @@ class HaystackDispatch : ConnDispatch
 //////////////////////////////////////////////////////////////////////////
 
   override Grid onLearn(Obj? arg)
+  {
+    throw Err("")
+  }
+
+  Future doLearn(Obj? arg)
   {
     // lazily build and cache noLearnTags using FolioUtil
     noLearnTags := noLearnTagsRef.val as Dict
@@ -167,8 +242,11 @@ class HaystackDispatch : ConnDispatch
 
     client := openClient
     req := arg == null ? Etc.makeEmptyGrid : Etc.makeListGrid(null, "navId", null, [arg])
-    res := client.call("nav", req)
+    return callThen("nav", req) |getGrid| { _doLearn(getGrid.get, noLearnTags) }
+  }
 
+  private static Grid _doLearn(Grid res, Dict noLearnTags)
+  {
     learnRows := Str:Obj?[,]
     res.each |row|
     {
@@ -244,8 +322,16 @@ class HaystackDispatch : ConnDispatch
       "lease": Number(10sec, null),
       "curValPoll": Marker.val]
     req := Etc.makeListGrid(reqMeta, "id", null, ids)
-    readGrid := call("watchSub", req)
+    _pointsByIndex := (Ref[]) pointsByIndex.map { it.id }.toImmutable
+    callThen("watchSub", req) |getGrid, me|
+    {
+      me._onSyncCur(getGrid.get, _pointsByIndex.map { me.point(it) })
+      return null
+    }
+  }
 
+  private Void _onSyncCur(Grid readGrid, ConnPoint[] pointsByIndex)
+  {
     // update point status based on result
     readGrid.each |readRow, i|
     {
@@ -306,8 +392,7 @@ class HaystackDispatch : ConnDispatch
     if (subIds.isEmpty) return
 
     // ask for a lease period at least 2 times longer than poll freq
-    leaseReq := (conn.pollFreq ?: 10sec) * 2
-    if (leaseReq < 1min) leaseReq = 1min
+    leaseReq := 1min.max(conn.pollFreq * 2) // Need the variable to be const, so we can't do reassignment
 
     // make request for subscription
     meta := [
@@ -318,8 +403,15 @@ class HaystackDispatch : ConnDispatch
     req := Etc.makeListGrid(meta, "id", null, subIds)
 
     // make the call
-    res := call("watchSub", req)
+    _subPoints := (Ref[]) subPoints.map { it.id }.toImmutable
+    callThen("watchSub", req) |getGrid, me| {
+      me._watchSub(getGrid.get, leaseReq, _subPoints.map { me.point(it) })
+      return null
+    }
+  }
 
+  private Void _watchSub(Grid res, Duration leaseReq, ConnPoint[] subPoints)
+  {
     // save away my watchId
     watchId := res.meta->watchId
     watchLeaseReq := leaseReq
@@ -395,22 +487,31 @@ class HaystackDispatch : ConnDispatch
     req := Etc.makeListGrid(meta, "id", null, ids)
 
     // make REST call
-    try
-      call("watchUnsub", req)
-    catch (Err e)
-      {}
+    callThen("watchUnsub", req) |getGrid, me| {
+      try getGrid.get
+      catch {}
 
-    // if no more points in watch, close watch
-    if (close) watchClear
+      // if no more points in watch, close watch
+      if (close) me.watchClear
+      return null
+    }
   }
 
   override Void onPollManual()
   {
     if (watchId == null) return
+    req := Etc.makeEmptyGrid(["watchId": watchId])
+    callThen("watchPoll", req) |getGrid, me| {
+      try me._onPollManual(getGrid.get)
+      catch (Err e) me.onWatchErr(e)
+      return null
+    }
+  }
+
+  private Void _onPollManual(Grid res) 
+  {
     try
     {
-      req := Etc.makeEmptyGrid(Etc.makeDict2("watchId", watchId, "curValSub", Marker.val))
-      res := call("watchPoll", req)
       res.each |rec|
       {
         id := rec["id"] ?: Ref.nullRef
@@ -462,7 +563,7 @@ class HaystackDispatch : ConnDispatch
   override Void onWrite(ConnPoint point, ConnWriteInfo info)
   {
     val   := info.val
-    level := info.level
+    level := Number(info.level)
     who   := info.who
 
     try
@@ -472,13 +573,16 @@ class HaystackDispatch : ConnDispatch
 
       // get write level
       writeLevel := toHaystackWriteLevel(point, info)
-      if (writeLevel == null) return
-
-      // check if we've changed the write level and if so, then
-      // write null to the old level
-      lastWriteLevel := point.data as Number
-      if (lastWriteLevel != null && lastWriteLevel != writeLevel)
-        callPointWrite(point, id, lastWriteLevel, null, null)
+      if (writeLevel == null)
+        writeLevel = level // Pass-Through the level
+      else
+      {
+        // check if we've changed the write level and if so, then
+        // write null to the old level
+        lastWriteLevel := point.data as Number
+        if (lastWriteLevel != null && lastWriteLevel != writeLevel)
+          callPointWrite(point, id, lastWriteLevel, null, null, level)
+      }
 
       // if tuning has writeSchedule and who is a schedule grid
       Str? schedule
@@ -487,9 +591,7 @@ class HaystackDispatch : ConnDispatch
         schedule = ZincWriter.gridToStr(timeline)
 
       // make REST call
-      callPointWrite(point, id, writeLevel, val, schedule)
-      setPointData(point, writeLevel)
-      point.updateWriteOk(info)
+      callPointWrite(point, id, writeLevel, val, schedule, level, info)
     }
     catch (Err e)
     {
@@ -497,14 +599,29 @@ class HaystackDispatch : ConnDispatch
     }
   }
 
-  private Grid callPointWrite(ConnPoint point, Obj id, Number writeLevel, Obj? val, Str? schedule)
+  private Future callPointWrite(ConnPoint point, Obj id, Number writeLevel, Obj? val, Str? schedule, Number level, ConnWriteInfo? info := null)
   {
     reqWho := "$rt.name :: $point.dis"
     map := ["id":id, "level":writeLevel, "who":reqWho]
     if (val != null) map["val"] = val
     if (schedule != null) map["schedule"] = schedule
     req := Etc.makeMapGrid(null, map)
-    return call("pointWrite", req)
+    _pointId := point.id
+    return info != null
+      ? callThen("pointWrite", req) |getGrid, me|
+        {
+          _point := me.point(_pointId)
+          try
+          {
+            getGrid.get
+            setPointData(_point, writeLevel)
+            _point.updateWriteOk(info)
+          }
+          catch (Err e)
+            _point.updateWriteErr(info, e)
+          return null
+        }
+      : callThen("pointWrite", req) |->| {}
   }
 
   private Number? toHaystackWriteLevel(ConnPoint pt, ConnWriteInfo info)
@@ -512,24 +629,15 @@ class HaystackDispatch : ConnDispatch
     // if no level
     x := pt.rec["haystackWriteLevel"]
     if (x == null)
-    {
-      pt.updateWriteErr(info, FaultErr("missing haystackWriteLevel"));
       return null
-    }
 
     // sanity on value
     num := x as Number
     if (num == null)
-    {
-      pt.updateWriteErr(info, FaultErr("haystackWriteLevel is $x.typeof.name not Number"));
-      return null
-    }
+      throw FaultErr("haystackWriteLevel is $x.typeof.name not Number")
 
     if (num.toInt < 1 || num.toInt > 17)
-    {
-      pt.updateWriteErr(info, FaultErr("haystackWriteLevel is not 1-17: $num"));
-      return null
-    }
+      throw FaultErr("haystackWriteLevel is not 1-17: $num")
 
     return num
   }
@@ -538,10 +646,10 @@ class HaystackDispatch : ConnDispatch
 // History
 //////////////////////////////////////////////////////////////////////////
 
-  Grid onHisRead(Ref id, Str range)
+  Obj? onHisRead(Ref id, Str range)
   {
     req := GridBuilder().addCol("id").addCol("range").addRow2(id, range).toGrid
-    return openClient.call("hisRead", req)
+    return callThen("hisRead", req) |getGrid| { getGrid.get }
   }
 
   override Obj? onSyncHis(ConnPoint point, Span span)
@@ -557,8 +665,20 @@ class HaystackDispatch : ConnDispatch
       req := GridBuilder().addCol("id").addCol("range").addRow2(hisId, range).toGrid
 
       // make REST call
-      res := openClient.call("hisRead", req)
+      _point := point.id
+      return callThen("hisRead", req) |getGrid, me| {
+        try return me._onSyncHis(me.point(_point), span, getGrid.get)
+        catch (Err e) me.point(_point).updateHisErr(e)
+        return null
+      }
+    }
+    catch (Err e) return point.updateHisErr(e)
+  }
 
+  private Obj? _onSyncHis(ConnPoint point, Span span, Grid res)
+  {
+    try
+    {
       // turn into his items
       items := HisItem[,]
       items.capacity = res.size
@@ -591,7 +711,7 @@ class HaystackDispatch : ConnDispatch
 // Fields
 //////////////////////////////////////////////////////////////////////////
 
-  private Client? client
+  private HaystackClient? client
   private Obj:Obj watchedIds := [:]  // ConnPoint or ConnPoint[]
   private WatchInfo? watchInfo
 }

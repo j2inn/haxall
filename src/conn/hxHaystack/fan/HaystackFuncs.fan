@@ -159,6 +159,22 @@ const class HaystackFuncs
     c := conn.eval(cx)
     options := opts.eval(cx) as Dict ?: Etc.emptyDict
 
+    s := buildExpr(expr, cx)
+
+    // check for debug
+    if (options.has("debug"))
+    {
+      echo("### haystackEval($conn)")
+      echo(s)
+    }
+
+    // make the call
+    return dispatch(cx, c, HxMsg("eval", s, options))
+  }
+
+  ** Utility method for building an expr for eval
+  static Str buildExpr(Expr expr, HxContext cx := curContext)
+  {
     // build do block with serialized vars in scope and expr itself
     exprStr := expr.toStr
     sb := StrBuf()
@@ -173,17 +189,7 @@ const class HaystackFuncs
     }
     sb.add("  ").add(exprStr).add("\n")
     sb.add("end\n")
-    s := sb.toStr
-
-    // check for debug
-    if (options.has("debug"))
-    {
-      echo("### haystackEval($conn)")
-      echo(s)
-    }
-
-    // make the call
-    return dispatch(cx, c, HxMsg("eval", s, options))
+    return sb.toStr
   }
 
   ** Quick and dirty way to tell if variable used in expression

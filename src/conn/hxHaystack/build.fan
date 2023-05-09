@@ -33,8 +33,12 @@ class Build : BuildPod
                 "folio @{hx.depend}",
                 "hx @{hx.depend}",
                 "hxConn @{hx.depend}",
+                "web @{fan.depend}",
+                "auth @{hx.depend}",
+                "skyarcd @{hx.depend}",
+                "connExt @{hx.depend}"
                 ]
-    srcDirs = [`fan/`, `test/`]
+    srcDirs = [`fan/`, `fan/extended/`, `test/`]
     resDirs = [`lib/`]
     index   = ["ph.lib": "haystack"]
   }
