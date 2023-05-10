@@ -14,6 +14,8 @@ using build
 **
 class Build : BuildPod
 {
+  static const Str buildVer := Env.cur.vars.get("SKY_SPARK_VERSION", /*default*/"3.1.5")
+
   new make()
   {
     podName = "hxHaystack"
@@ -26,6 +28,7 @@ class Build : BuildPod
                "vcs.name":     "Git",
                "vcs.uri":      "https://github.com/haxall/haxall",
                ]
+    version = Version(buildVer)
     depends  = ["sys @{fan.depend}",
                 "concurrent @{fan.depend}",
                 "haystack @{hx.depend}",

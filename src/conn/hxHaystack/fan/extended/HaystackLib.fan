@@ -23,14 +23,11 @@ const class HaystackLib : HaystackLibBase {
   
   private const AtomicRef haystackActorsByIdRef := AtomicRef(Ref:HaystackActor[:].toImmutable)
   
-  @NoDoc new make() : super() 
-  {
-    this.proj = HxContext.curHx.rt->proj
-  }
+  @NoDoc new make() : super() {}
   
   override Void onStart() {
     filter := Filter.has(model.connTag)
-    ((AtomicRef) this->connConcernRef).val = proj.concernOpen(filter, Etc.emptyDict, #onConnConcernEventHaystack.func.bind([this]))
+    ((AtomicRef) this->connConcernRef).val = ((Proj)HxContext.curHx.rt->proj).concernOpen(filter, Etc.emptyDict, #onConnConcernEventHaystack.func.bind([this]))
     if (model.pollMode.isEnabled)
       this->poller->onStart
   }
@@ -57,7 +54,6 @@ const class HaystackLib : HaystackLibBase {
     }
   }
   private const |ConcernEvent| onConnConcernEventOrig := ConnImplExt#.method("onConnConcernEvent").func.bind([this])
-  const Proj proj
 }
 
 const class HaystackLibProxy {
