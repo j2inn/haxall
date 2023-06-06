@@ -38,7 +38,7 @@ fi
 
 if [ -z "$BUILD_VERSION" ]
 then
-	export BUILD_VERSION="5.1.4"
+	export BUILD_VERSION="5.1.5"
 fi
 
 if [ -z "$SKY_SPARK_VERSION" ]
