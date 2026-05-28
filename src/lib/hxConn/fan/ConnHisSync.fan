@@ -11,6 +11,7 @@
 
 using haystack
 using axon
+using concurrent
 using hx
 using folio
 
@@ -141,7 +142,12 @@ internal class ConnSyncHis : AbstractSyncHis
     // route to connector actor; block forever here and rely on each
     // connector to not lock up its queue for too long; we check for
     // task cancellation using context heartbeat
-    return pt.conn.send(HxMsg("syncHis", pt, span)).get(null)
+    result := pt.conn.send(HxMsg("syncHis", pt, span)).get(null)
+    
+    if (result is Future)
+      return ((Future)result).get(null)
+    
+    return result
   }
 
 }

@@ -18,6 +18,7 @@ class Build : BuildPod
   {
     podName = "hxConn"
     summary = "Haxall connector framework"
+    version = Version("3.1.12.1")
     meta    = ["org.name":     "SkyFoundry",
                "org.uri":      "https://skyfoundry.com/",
                "proj.name":    "Haxall",
